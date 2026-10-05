@@ -72,9 +72,9 @@ Dockerfile 里的构建参数按 `ARG` 名自动推断，不用额外配置：
 
 | 项目 | 实际传入 |
 | --- | --- |
-| discuz-x5 | `DISCUZ_URL`、`DISCUZ_VERSION` |
+| discuz | `DISCUZ_URL`、`DISCUZ_VERSION` |
 | mybb | `MYBB_URL`、`MYBB_VERSION` |
-| qinglong | `QINGLONG_VERSION`（基础镜像用 Dockerfile 默认的 `ghcr.io/whyour/qinglong:debian`） |
+| qinglong-playwright | `QINGLONG_VERSION`（基础镜像用 Dockerfile 默认的 `ghcr.io/whyour/qinglong:debian`；playwright 不写死版本，每次构建都装当时的最新版，pypi 或浏览器 CDN 不通时加 `--build-arg PIP_INDEX=https://mirrors.aliyun.com/pypi/simple --build-arg PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright` 换源） |
 
 声明了 `GITHUB_URL`、`*_REPO_URL`、`*_TAG`、`*_REF` 这类 ARG 的项目会一起传入对应值。
 
@@ -125,10 +125,10 @@ Dockerfile 里的构建参数按 `ARG` 名自动推断，不用额外配置：
 - 本地已有同版本镜像时跳过，`--force` 强制重建；
 - 任何项目失败都不会影响其他项目，最后打印汇总表并以非 0 退出码结束。
 
-`discuz-x5/`、`mybb/`、`qinglong/` 里还有 `docker-compose.yml`，想跑容器时直接用：
+`discuz/`、`mybb/`、`qinglong-playwright/` 里还有 `docker-compose.yml`，想跑容器时直接用：
 
 ```bash
 cd mybb && docker compose up -d --build
-cd ../discuz-x5 && docker compose up -d --build
-cd ../qinglong && docker compose up -d --build
+cd ../discuz && docker compose up -d --build
+cd ../qinglong-playwright && docker compose up -d --build
 ```
