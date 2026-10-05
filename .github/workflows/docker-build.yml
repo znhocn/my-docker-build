@@ -34,6 +34,8 @@ concurrency:
   # never cancel a publish halfway, that would leave a partial set of images
   cancel-in-progress: false
 
+# No repository secret is used anywhere: github.token is created automatically for
+# every run, it reads the GitHub API and logs in to GHCR (see the permissions block above).
 permissions:
   contents: read
   packages: write
@@ -52,14 +54,26 @@ jobs:
         with:
           python-version: "3.x"
 
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
       - name: Build the plan
         id: plan
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           WANT: ${{ inputs.project }}
+          IMAGE_PREFIX: ${{ env.REGISTRY }}/${{ github.actor }}
+          FORCE: ${{ inputs.force }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, os, re, sys, urllib.parse, urllib.request
+          import json, os, re, subprocess, sys, urllib.parse, urllib.request
           from pathlib import Path
 
           API = "https://api.github.com"
@@ -101,6 +115,21 @@ jobs:
               if value is None:
                   return True
               return str(value).strip().lower() in ("true", "yes", "on", "1", "y")
+
+          def flag(name):
+              return str(os.environ.get(name, "")).strip().lower() in ("true", "1", "yes")
+
+          def published(image):
+              """Return the version label of an already published image, empty when unknown."""
+              proc = subprocess.run(
+                  ["docker", "buildx", "imagetools", "inspect", "--format",
+                   '{{ index .Image.Labels "org.opencontainers.image.version" }}', image],
+                  capture_output=True, text=True)
+              return proc.stdout.strip() if proc.returncode == 0 else ""
+
+          def exists(image):
+              return subprocess.run(["docker", "buildx", "imagetools", "inspect", image],
+                                    capture_output=True).returncode == 0
 
           def normalize(text):
               return re.sub(r"[^a-z0-9]+", "", str(text).lower())
@@ -206,6 +235,7 @@ jobs:
                   raise SystemExit(f"no such project: {', '.join(sorted(missing))}")
               projects = [p for p in projects if p.name in picked]
 
+          prefix = os.environ.get("IMAGE_PREFIX", "ghcr.io").strip("/")
           matrix = []
           for directory in projects:
               config = read_config(directory / "project.yaml")
@@ -223,6 +253,23 @@ jobs:
               pattern = section.get("pattern", "") if isinstance(section, dict) else str(section or "")
               version = clean_version(tag, pattern, [directory.name, owner, repo])
               print(f"::notice::{directory.name}: {source} {tag} -> version {version}", file=sys.stderr)
+
+              # Compare the published version with the latest release and only keep the project
+              # when it is out of date. The version label of the multi-arch :latest image cannot be
+              # read, so fall back to checking whether this exact version tag is already there.
+              image = f"{prefix}/{directory.name}"
+              if flag("DRY_RUN"):
+                  print(f"::notice::{directory.name}: dry run, keeping {image}:{version} in the plan", file=sys.stderr)
+              else:
+                  current = published(f"{image}:latest")
+                  if flag("FORCE"):
+                      print(f"::notice::{directory.name}: force is set, rebuilding {image}:{version}", file=sys.stderr)
+                  elif current and current == version:
+                      print(f"::notice::{directory.name}: {image} is already at {version}, skipping", file=sys.stderr)
+                      continue
+                  elif not current and exists(f"{image}:{version}"):
+                      print(f"::notice::{directory.name}: {image}:{version} is already published, skipping", file=sys.stderr)
+                      continue
 
               entry = {"project": directory.name, "repo": f"{owner}/{repo}", "version": version, "tag": tag,
                        "source": source, "dockerfile": "", "build_args": {}}
@@ -261,7 +308,7 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Build and push
         env:
@@ -298,11 +345,6 @@ jobs:
 
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             echo "docker buildx build ${args[*]} --platform $PLATFORMS --push"
-            exit 0
-          fi
-
-          if [ "${{ inputs.force }}" != "true" ] && docker buildx imagetools inspect "$image:$VERSION" >/dev/null 2>&1; then
-            echo "$PROJECT:$VERSION already exists on the registry, skipping (tick force to rebuild)"
             exit 0
           fi
 

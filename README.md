@@ -47,8 +47,19 @@ Dockerfile 里的构建参数按 `ARG` 名自动推断，不用额外配置：
 - 每天 04:00 UTC（北京时间 12:00）跑一次，也可以手动触发（Actions → Docker Build and Publish → Run workflow）
 - 手动触发可填项目（逗号分隔，留空或 `all` = 全部，取值就是仓库里的子目录名）、目标平台、是否强制重建、是否只 dry-run
 - 默认同时构建 `linux/amd64,linux/arm64`，用 buildx + QEMU 模拟，推送到 `ghcr.io/<owner>/<项目>:<版本>` 和 `:latest`
-- 远端已有同版本镜像就跳过（勾 `force` 才会重建），所以定时任务只重新发布真正更新的项目
+- **不需要在仓库里配置任何 secret**：用 Actions 自动生成的 `github.token` 调 GitHub API 并登录 GHCR，配 `permissions: contents: read` + `packages: write` 即可推送
 - 取版本、读 `project.yaml`、推断构建参数、找不到本地 Dockerfile 时 clone tag，都是 job 里的内联 python 完成的
+
+### 有新版本才构建
+
+`plan` job 在决定要不要开构建之前，先比对已发布镜像的版本号和刚取到的最新 release 版本号：
+
+1. 读 `ghcr.io/<owner>/<项目>:latest` 镜像的 `org.opencontainers.image.version` label，和最新版本号一致就说明镜像已是最新，直接不进 matrix，连构建 runner 都不会起；
+2. 已发布版本号更旧（或镜像不存在）才进 matrix 重建并推送，新旧一致以外的第三种情况也会重建；
+3. 多架构 manifest 的 label 读不出来，这时退化为检查 `:<版本>` 这个 tag 是否已存在，存在即视为已发布；
+4. 勾 `force` 无视以上判断全部重建；勾 `dry-run` 不做版本比对，全部列进计划方便查看。
+
+结果打在 Actions 日志里，例如 `mybb: ghcr.io/<owner>/mybb is already at 1841, skipping`。
 
 ## 本地构建（build-latest.py）
 
