@@ -7,17 +7,33 @@
 
 ## 配置
 
-每个子项目一个 `project.yaml`，这是唯一的配置来源：
+每个子项目一个 `project.yaml`，这是唯一的配置来源（键名大小写都认）：
 
 ```yaml
 enable: true                              # false 时检查和构建都跳过，不写默认启用
 GitHub: https://github.com/mybb/mybb      # 上游仓库，GitLab / Gitee 写法见下
 version:                                  # 可选：从 tag 里提取版本号
   pattern: '[0-9]+\.[0-9]+[-_.][0-9]{8}'  # 例：tag 为 X5.0-20261001#2 时版本号取 5.0-20261001
+container_name: mybb                      # 可选：镜像名，不写默认用子项目目录名
+build_context: "./lib"                    # 可选：构建上下文，相对源码根目录
+dockerfile: "./lib/Dockerfile"            # 可选：Dockerfile，相对源码根目录
+pre_build_cmd: ""                         # 可选：构建前在源码根目录执行的命令，一行一条
 ```
 
 - 版本号默认去掉 tag 里的构建号（`X5.0-20261001#2` → `X5.0-20261001`），需要别的规则就写 `version.pattern`。
 - 镜像标签：上游版本号 + `latest`。
+
+### 构建位置：dockerfile / build_context / pre_build_cmd
+
+子项目目录里有 `Dockerfile` 就用它构建；没有就把上游对应版本 `git clone --depth 1 --branch <tag>` 到 `.build/<项目>/`，用上游自带的 Dockerfile 构建。三个键用来覆盖这套默认行为：
+
+- `dockerfile` / `build_context` 都是**相对源码根目录**的路径，源码根目录 = 声明的 Dockerfile 在子项目目录里时的子项目目录，否则是克隆出来的上游仓库根目录；
+- 声明的路径先在子项目目录里找，找不到再在克隆结果里找，两处都没有就报错（不会退回上游自带的 Dockerfile）；
+- 不写 `build_context` 时默认取 Dockerfile 所在目录，写了 `dockerfile` 但没写 `build_context` 就等于写了 `dirname(dockerfile)`；
+- `pre_build_cmd` 在源码根目录（clone 后的仓库根目录）里 `sh -c` 执行，一行一条，按顺序执行，失败即中止构建；`--dry-run` 只打印不执行；
+- 明确配置了 `dockerfile` 的项目会和仓库内的 Dockerfile 一样推断构建参数；纯克隆、用上游自带 Dockerfile 的项目保持上游默认值，只接受 `--build-arg` 覆盖。
+
+`openbb/project.yaml` 就是这套配置的例子：上游的 `Dockerfile` 在子目录里，写明路径后不需要在仓库里再放一份。
 
 ### 上游仓库：GitHub / GitLab / Gitee
 
@@ -66,9 +82,9 @@ Dockerfile 里的构建参数按 `ARG` 名自动推断，不用额外配置：
 
 - 每天 04:00 UTC（北京时间 12:00）跑一次，也可以手动触发（Actions → Docker Build and Publish → Run workflow）
 - 手动触发可填项目（逗号分隔，留空或 `all` = 全部，取值就是仓库里的子目录名）、目标平台、是否强制重建、是否只 dry-run
-- 默认同时构建 `linux/amd64,linux/arm64`，用 buildx + QEMU 模拟，推送到 `ghcr.io/<owner>/<项目>:<版本>` 和 `:latest`
+- 默认同时构建 `linux/amd64,linux/arm64`，用 buildx + QEMU 模拟，推送到 `ghcr.io/<owner>/<项目名>:<版本>` 和 `:latest`（`<项目名>` 是 `container_name`，没写就是子目录名）
 - **不需要在仓库里配置任何 secret**：用 Actions 自动生成的 `github.token` 调 GitHub API 并登录 GHCR，配 `permissions: contents: read` + `packages: write` 即可推送
-- 取版本、读 `project.yaml`、推断构建参数、找不到本地 Dockerfile 时 clone tag，都是 job 里的内联 python 完成的
+- 取版本、读 `project.yaml`、推断构建参数、按 `dockerfile` / `build_context` 定位构建位置、找不到本地 Dockerfile 时 clone tag、执行 `pre_build_cmd`，都是 job 里的内联 python / shell 完成的，`project.yaml` 的键和 `build-latest.py` 一致
 
 ### 有新版本才构建
 
@@ -98,6 +114,8 @@ Dockerfile 里的构建参数按 `ARG` 名自动推断，不用额外配置：
 
 - 子项目目录里有 `Dockerfile` 就用它构建；
 - 没有就把上游对应版本 `git clone --depth 1 --branch <tag>` 到 `.build/<项目>/`（已 gitignore），用上游自带的 Dockerfile 构建；
+- `dockerfile` / `build_context` / `pre_build_cmd` 可以覆盖上面两条，规则见上面「构建位置」一节；
+- `container_name` 可以覆盖镜像名里的项目名；
 - `enable: false` 的项目跳过；
 - 本地已有同版本镜像时跳过，`--force` 强制重建；
 - 任何项目失败都不会影响其他项目，最后打印汇总表并以非 0 退出码结束。

@@ -18,7 +18,12 @@ built and published by .github/workflows/docker-build.yml, which does not use th
   is stripped (mybb_1841 -> 1841) while a leading v is kept (openbb-v5.0.0 -> v5.0.0).
   version.pattern overrides this with a custom regex.
 - Build: the Dockerfile inside the subproject directory is used when present, otherwise the
-  matching upstream version is cloned with git and built from its own Dockerfile.
+  matching upstream version is cloned with git and built from its own Dockerfile. dockerfile and
+  build_context override that: both are relative to the source root (the subproject directory when
+  the declared dockerfile is there, the clone otherwise) and build_context defaults to the directory
+  of the dockerfile. pre_build_cmd runs in the source root before the build, one command per line.
+- Image: container_name overrides the subproject directory name in the image name, so the tags
+  become <registry>/<owner>/<container_name>:<version> instead of using the directory name.
 - Build args are guessed from the ARG names in the Dockerfile (*_VERSION / *_TAG / *_URL,
   BASE_IMAGE keeps its default value); --build-arg overrides them. For *_URL the release asset is
   preferred (matched by the archive format used in the Dockerfile and by repo name) and the
@@ -161,6 +166,20 @@ def pick_key(config, key):
         if value not in (None, ""):
             return value
     return ""
+
+
+def config_text(config, key):
+    """Read a scalar config value as text, an empty value counts as missing."""
+    value = pick_key(config, key)
+    if isinstance(value, dict):
+        # the pyyaml-less parser turns a valueless key into an empty mapping
+        return ""
+    return str(value or "").strip().strip("\"'")
+
+
+def config_commands(config, key):
+    """Read a command list from project.yaml, one command per line, empty when there is none."""
+    return [line.strip() for line in config_text(config, key).splitlines() if line.strip()]
 
 
 def detect_provider(host, declared=""):
@@ -452,6 +471,61 @@ def find_dockerfile(directory):
     return unique[0] if unique else None
 
 
+def local_build_paths(project_dir, dockerfile_cfg, context_cfg):
+    """Resolve the (dockerfile, context) of a subproject that builds from its own directory.
+
+    Returns (None, None) when the project has no usable Dockerfile there and the upstream clone has
+    to provide one.
+    """
+    if dockerfile_cfg:
+        dockerfile = project_dir / dockerfile_cfg
+        if not dockerfile.is_file():
+            return None, None
+        context = (project_dir / context_cfg) if context_cfg else dockerfile.parent
+        return dockerfile, context
+    found = find_dockerfile(project_dir)
+    return (found, project_dir) if found else (None, None)
+
+
+def cloned_build_paths(dest, dockerfile_cfg, context_cfg):
+    """Same as local_build_paths for a clone of the upstream source, errors out when nothing fits."""
+    if dockerfile_cfg:
+        dockerfile = dest / dockerfile_cfg
+        if not dockerfile.is_file():
+            raise BuildError(f"project.yaml declares dockerfile {dockerfile_cfg}, "
+                             f"but the cloned source has no such file: {dockerfile}")
+        context = (dest / context_cfg) if context_cfg else dockerfile.parent
+        return dockerfile, context
+    found = find_dockerfile(dest)
+    if not found:
+        raise BuildError(f"the cloned source has no Dockerfile either: {dest}")
+    return found, dest
+
+
+def relative(path, base):
+    """Display a path relative to base when it is below it, the plain path otherwise."""
+    try:
+        return str(path.relative_to(base))
+    except ValueError:
+        return str(path)
+
+
+def planned_clone_paths(name, build_dir, dockerfile_cfg, context_cfg):
+    """The paths a clone of the upstream source will build from, reported by --dry-run."""
+    base = Path(build_dir) / name
+    if not dockerfile_cfg:
+        return str(base)
+    dockerfile = base / dockerfile_cfg
+    return str(base / context_cfg) if context_cfg else str(dockerfile)
+
+
+def run_commands(commands, cwd):
+    """Run the pre_build_cmd commands of a project in its source root, one shell command per line."""
+    for command in commands:
+        log(f"  $ {command}")
+        run(["sh", "-c", command], cwd=cwd)
+
+
 def clone_at(url, version, dest):
     if shutil.which("git") is None:
         raise BuildError("git not found, cannot clone the upstream source")
@@ -598,7 +672,13 @@ def process_project(name, root, args):
         version = docker_tag(clean_version(tag_name, pattern, names))
         result.update(version=version, source=f"{info['source']} {tag_name}")
 
-        image = image_name(name, args.registry, args.owner or (git_owner(root) if args.registry else ""))
+        project_dir = root / name
+        container = config_text(project_config, "container_name") or name
+        dockerfile_cfg = config_text(project_config, "dockerfile")
+        context_cfg = config_text(project_config, "build_context")
+        commands = config_commands(project_config, "pre_build_cmd")
+
+        image = image_name(container, args.registry, args.owner or (git_owner(root) if args.registry else ""))
         tags = [f"{image}:{version}"]
         if not args.no_latest:
             tags.append(f"{image}:latest")
@@ -610,40 +690,55 @@ def process_project(name, root, args):
                 log(f"[{name}] local image {image}:{version} already exists, use --force to rebuild")
                 return result
 
-        dockerfile = find_dockerfile(root / name)
         override_args = cli_build_args(args.build_arg)
         labels = {
-            "org.opencontainers.image.title": name,
+            "org.opencontainers.image.title": container,
             "org.opencontainers.image.version": version,
             "org.opencontainers.image.source": repo["web"],
         }
 
-        if dockerfile:
-            result["context"] = f"{name}/{dockerfile.name}"
-            log(f"[{name}] using local Dockerfile: {dockerfile.relative_to(root)}")
+        # a declared dockerfile is looked up in the subproject directory first and inside the clone
+        # afterwards, without one the local Dockerfile is used and otherwise the clone provides it
+        dockerfile, context = local_build_paths(project_dir, dockerfile_cfg, context_cfg)
+        needs_clone = dockerfile is None
+        source = root / args.build_dir / name if needs_clone else project_dir
+        # the upstream Dockerfile of a plain clone keeps its own defaults, only an explicitly
+        # configured or repository owned dockerfile gets the guessed build args
+        guess = bool(dockerfile_cfg) or not needs_clone
+
+        if needs_clone:
+            missing = f", {dockerfile_cfg} is not there" if dockerfile_cfg else ""
+            log(f"[{name}] no local Dockerfile{missing}, cloning {result['repo']} @ {tag_name}")
+            planned = planned_clone_paths(name, args.build_dir, dockerfile_cfg, context_cfg)
+        else:
+            log(f"[{name}] using Dockerfile: {relative(dockerfile, root)}")
+            planned = relative(context, root)
+        log(f"[{name}] build context: {planned}")
+
+        if args.dry_run:
+            result.update(context=planned,
+                          status="pending clone and build" if needs_clone else "pending build",
+                          note=f"clone {result['repo']} @ {tag_name}, then build" if needs_clone
+                          else f"Dockerfile {relative(dockerfile, root)}")
+            for command in commands:
+                log(f"  pre_build_cmd: {command}")
+            return result
+
+        if needs_clone:
+            clone_at(repo["clone"], tag_name, source)
+            dockerfile, context = cloned_build_paths(source, dockerfile_cfg, context_cfg)
+
+        result["context"] = relative(context, root)
+        run_commands(commands, source)
+        if guess:
             build_args = guess_build_args(dockerfile.read_text(encoding="utf-8", errors="replace"),
                                           version, tag_name, name, repo, info["release"])
             build_args.update(override_args)
-            for key, value in build_args.items():
-                log(f"  --build-arg {key}={value}")
-            if args.dry_run:
-                result.update(status="pending build", note="using local Dockerfile")
-                return result
-            build_image(root / name, dockerfile, tags, build_args, args.platform, labels)
         else:
-            result["context"] = f"{args.build_dir}/{name}"
-            log(f"[{name}] no local Dockerfile, cloning {result['repo']} @ {tag_name}")
-            if args.dry_run:
-                result.update(status="pending clone and build", note="clone the upstream source, then build")
-                return result
-            dest = root / args.build_dir / name
-            clone_at(repo["clone"], tag_name, dest)
-            dockerfile = find_dockerfile(dest)
-            if not dockerfile:
-                raise BuildError(f"the cloned source has no Dockerfile either: {dest}")
-            for key, value in override_args.items():
-                log(f"  --build-arg {key}={value}")
-            build_image(dest, dockerfile, tags, override_args, args.platform, labels)
+            build_args = dict(override_args)
+        for key, value in build_args.items():
+            log(f"  --build-arg {key}={value}")
+        build_image(context, dockerfile, tags, build_args, args.platform, labels)
 
         result.update(status="ok", note=", ".join(tags))
         return result

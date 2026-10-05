@@ -1,2 +1,6 @@
+container_name: openbb
 enable: true
 github: https://github.com/openbq-org/OpenBB
+build_context: "openbb_platform"
+dockerfile: "openbb_platform/Dockerfile"
+pre_build_cmd: ""
