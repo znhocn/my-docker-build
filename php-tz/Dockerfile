@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=php:7.4-apache
+ARG BASE_IMAGE=php:7.4-apache-buster
 FROM ${BASE_IMAGE}
 
 RUN echo "deb http://archive.debian.org/debian buster main contrib non-free" > /etc/apt/sources.list \

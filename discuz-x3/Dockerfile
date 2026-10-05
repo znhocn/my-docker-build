@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=php:7.4-apache
+ARG BASE_IMAGE=php:7.4-apache-buster
 FROM ${BASE_IMAGE}
 
 # 本地构建从 .env 读取
