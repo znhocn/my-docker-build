@@ -13,10 +13,12 @@ built and published by .github/workflows/docker-build.yml, which does not use th
   supported. The repository is taken from the github / gitlab / gitee / git key, or from the
   generic repo / repository / url / source / upstream key with the provider detected from the
   host name; provider: forces it when the host is unrecognisable.
-- Version: the newest release that is neither draft nor prerelease; if there is none it
-  falls back to tags. The build suffix (#2) is dropped, and a repeated project/repo name prefix
-  is stripped (mybb_1841 -> 1841) while a leading v is kept (openbb-v5.0.0 -> v5.0.0).
-  version.pattern overrides this with a custom regex.
+- Version: a scalar version in project.yaml pins the version, the upstream release is not looked
+  up at all and that value becomes both the image tag and the ref used to clone. Otherwise the newest
+  release that is neither draft nor prerelease is used; if there is none it falls back to tags. The
+  build suffix (#2) is dropped, and a repeated project/repo name prefix is stripped
+  (mybb_1841 -> 1841) while a leading v is kept (openbb-v5.0.0 -> v5.0.0). A version mapping
+  (version.pattern) extracts the version from the tag with a custom regex instead.
 - Build: the Dockerfile inside the subproject directory is used when present, otherwise the
   matching upstream version is cloned with git and built from its own Dockerfile. dockerfile and
   build_context override that: both are relative to the source root (the subproject directory when
@@ -180,6 +182,18 @@ def config_text(config, key):
 def config_commands(config, key):
     """Read a command list from project.yaml, one command per line, empty when there is none."""
     return [line.strip() for line in config_text(config, key).splitlines() if line.strip()]
+
+
+def version_config(config):
+    """Read the version section of project.yaml as a (pinned_version, pattern) pair.
+
+    A scalar version (version: 1.0.0) pins the version, an empty value pins nothing and a mapping
+    only carries the pattern that extracts the version from the upstream tag.
+    """
+    section = pick_key(config, "version")
+    if isinstance(section, dict):
+        return "", config_text(section, "pattern")
+    return config_text(config, "version"), ""
 
 
 def detect_provider(host, declared=""):
@@ -663,14 +677,22 @@ def process_project(name, root, args):
             raise BuildError(f"{name}/project.yaml does not declare a repository "
                              f"(use a github:, gitlab:, gitee: or git: key)")
         result["repo"] = repo["path"]
-        log(f"[{name}] resolving the latest {repo['provider']} version of {repo['path']} ...")
-        info = resolve_version(repo, ref=args.ref, include_prerelease=args.include_prerelease)
-        tag_name = info["version"]
-        version_cfg = project_config.get("version")
-        pattern = version_cfg.get("pattern", "") if isinstance(version_cfg, dict) else str(version_cfg or "")
-        names = [name, *repo["path"].split("/"), re.sub(r"[-_.]+", "-", repo["path"].split("/")[-1]).lower()]
-        version = docker_tag(clean_version(tag_name, pattern, names))
-        result.update(version=version, source=f"{info['source']} {tag_name}")
+        pinned, pattern = version_config(project_config)
+        release = None
+        if pinned:
+            log(f"[{name}] version {pinned} is pinned in project.yaml, not looking the upstream up")
+            tag_name = args.ref or pinned
+            version = docker_tag(pinned)
+            version_source = "project.yaml"
+        else:
+            log(f"[{name}] resolving the latest {repo['provider']} version of {repo['path']} ...")
+            info = resolve_version(repo, ref=args.ref, include_prerelease=args.include_prerelease)
+            tag_name = info["version"]
+            release = info["release"]
+            names = [name, *repo["path"].split("/"), re.sub(r"[-_.]+", "-", repo["path"].split("/")[-1]).lower()]
+            version = docker_tag(clean_version(tag_name, pattern, names))
+            version_source = f"{info['source']} {tag_name}"
+        result.update(version=version, source=version_source)
 
         project_dir = root / name
         container = config_text(project_config, "container_name") or name
@@ -732,7 +754,7 @@ def process_project(name, root, args):
         run_commands(commands, source)
         if guess:
             build_args = guess_build_args(dockerfile.read_text(encoding="utf-8", errors="replace"),
-                                          version, tag_name, name, repo, info["release"])
+                                          version, tag_name, name, repo, release)
             build_args.update(override_args)
         else:
             build_args = dict(override_args)

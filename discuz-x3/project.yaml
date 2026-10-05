@@ -1,5 +1,7 @@
-enable: false
+container_name: discuz
+enable: true
 gitee: https://gitee.com/Discuz/DiscuzX
 # 可选：从 tag 里提取版本号（tag 是 X3.5-20260504，版本号取 3.5-20260504）
-version:
-  pattern: '[3]+\.[0-9]+[-_.][0-9]{8}'
+# version:
+#   pattern: '[3]+\.[0-9]+[-_.][0-9]{8}'
+version: 3.5-20260504

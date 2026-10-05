@@ -12,16 +12,18 @@
 ```yaml
 enable: true                              # false 时检查和构建都跳过，不写默认启用
 GitHub: https://github.com/mybb/mybb      # 上游仓库，GitLab / Gitee 写法见下
-version:                                  # 可选：从 tag 里提取版本号
-  pattern: '[0-9]+\.[0-9]+[-_.][0-9]{8}'  # 例：tag 为 X5.0-20261001#2 时版本号取 5.0-20261001
+version: v1.0.0                           # 可选：写死版本号，此时不再去上游查版本
+# version:                                # 也可以写成映射，只从 tag 里提取版本号
+#   pattern: '[0-9]+\.[0-9]+[-_.][0-9]{8}'  # 例：tag 为 X5.0-20261001#2 时版本号取 5.0-20261001
 container_name: mybb                      # 可选：镜像名，不写默认用子项目目录名
 build_context: "./lib"                    # 可选：构建上下文，相对源码根目录
 dockerfile: "./lib/Dockerfile"            # 可选：Dockerfile，相对源码根目录
 pre_build_cmd: ""                         # 可选：构建前在源码根目录执行的命令，一行一条
 ```
 
-- 版本号默认去掉 tag 里的构建号（`X5.0-20261001#2` → `X5.0-20261001`），需要别的规则就写 `version.pattern`。
-- 镜像标签：上游版本号 + `latest`。
+- **`version` 写成一个值就是固定版本号**：直接用它当镜像标签，不再请求上游接口，`--ref` 仍可指定克隆用的 ref（不写就用版本号本身当 ref）；因为没有 release 详情，`*_URL` 构建参数拿不到 release 附件，需要的话用 `--build-arg` 传。
+- **`version` 写成映射只提供提取规则**，版本号仍然去上游查：默认去掉 tag 里的构建号（`X5.0-20261001#2` → `X5.0-20261001`），需要别的规则就写 `version.pattern`。
+- 镜像标签：版本号 + `latest`。
 
 ### 构建位置：dockerfile / build_context / pre_build_cmd
 
@@ -59,8 +61,8 @@ Dockerfile 里的构建参数按 `ARG` 名自动推断，不用额外配置：
 
 | Dockerfile 里的 ARG | 传入的值 |
 | --- | --- |
-| `*_VERSION` | 上游版本号 |
-| `*_TAG` / `*_REF` | 上游 tag |
+| `*_VERSION` | 版本号（`version` 写死时就是写死的那个） |
+| `*_TAG` / `*_REF` | 上游 tag（`version` 写死时是版本号本身，或 `--ref` 给的值） |
 | `GITHUB_URL` / `GITLAB_URL` / `GITEE_URL` / `GIT_URL` / `*_REPO_URL` | 上游仓库地址 |
 | `*_URL` / `*_DOWNLOAD_URL` / `*_SRC_URL` | release 附件（按 Dockerfile 用的解压格式 + 仓库名匹配，例如 `unzip` 就找 `.zip`），没有合适附件就用该 tag 的源码压缩包 |
 | `BASE_IMAGE` | 保持 Dockerfile 里的默认值 |
@@ -84,7 +86,7 @@ Dockerfile 里的构建参数按 `ARG` 名自动推断，不用额外配置：
 - 手动触发可填项目（逗号分隔，留空或 `all` = 全部，取值就是仓库里的子目录名）、目标平台、是否强制重建、是否只 dry-run
 - 默认同时构建 `linux/amd64,linux/arm64`，用 buildx + QEMU 模拟，推送到 `ghcr.io/<owner>/<项目名>:<版本>` 和 `:latest`（`<项目名>` 是 `container_name`，没写就是子目录名）
 - **不需要在仓库里配置任何 secret**：用 Actions 自动生成的 `github.token` 调 GitHub API 并登录 GHCR，配 `permissions: contents: read` + `packages: write` 即可推送
-- 取版本、读 `project.yaml`、推断构建参数、按 `dockerfile` / `build_context` 定位构建位置、找不到本地 Dockerfile 时 clone tag、执行 `pre_build_cmd`，都是 job 里的内联 python / shell 完成的，`project.yaml` 的键和 `build-latest.py` 一致
+- 取版本、读 `project.yaml`、推断构建参数、按 `dockerfile` / `build_context` 定位构建位置、找不到本地 Dockerfile 时 clone tag、执行 `pre_build_cmd`，都是 job 里的内联 python / shell 完成的，`project.yaml` 的键和 `build-latest.py` 一致（包括 `version` 写死版本号时不查上游）
 
 ### 有新版本才构建
 
@@ -96,6 +98,8 @@ Dockerfile 里的构建参数按 `ARG` 名自动推断，不用额外配置：
 4. 勾 `force` 无视以上判断全部重建；勾 `dry-run` 不做版本比对，全部列进计划方便查看。
 
 结果打在 Actions 日志里，例如 `mybb: ghcr.io/<owner>/mybb is already at 1841, skipping`。
+
+`version` 写死版本号的项目比的是这个写死的值：上游发了新 release 也不会自动重建，要跟着上游更新就手动改 `project.yaml`（或者干脆删掉 `version` 让它继续自动查）。
 
 ## 本地构建（build-latest.py）
 
@@ -117,6 +121,7 @@ Dockerfile 里的构建参数按 `ARG` 名自动推断，不用额外配置：
 - `dockerfile` / `build_context` / `pre_build_cmd` 可以覆盖上面两条，规则见上面「构建位置」一节；
 - `container_name` 可以覆盖镜像名里的项目名；
 - `enable: false` 的项目跳过；
+- `version` 写死的项目不查上游，克隆时用写死的版本号当 ref（`--ref` 可以换掉）；
 - 本地已有同版本镜像时跳过，`--force` 强制重建；
 - 任何项目失败都不会影响其他项目，最后打印汇总表并以非 0 退出码结束。
 

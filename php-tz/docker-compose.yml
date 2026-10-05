@@ -1,0 +1,10 @@
+services:
+  php-tz:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: php-tz:latest
+    container_name: php-tz
+    restart: unless-stopped
+    ports:
+      - 8080:80

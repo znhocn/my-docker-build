@@ -188,7 +188,7 @@ jobs:
 
           def read_config(path):
               """Read enable / repository (github, gitlab, gitee) / container_name / dockerfile /
-              build_context / pre_build_cmd / version.pattern from project.yaml without depending
+              build_context / pre_build_cmd / version from project.yaml without depending
               on pyyaml."""
               config, section, block = {}, None, None
               for raw in path.read_text(encoding="utf-8").splitlines():
@@ -358,14 +358,25 @@ jobs:
                   print(f"::error::{directory.name}/project.yaml does not declare a repository "
                         f"(use a github:, gitlab:, gitee: or git: key)", file=sys.stderr)
                   continue
-              try:
-                  tag, source, release = latest_version(repo)
-              except SystemExit as err:
-                  print(f"::error::{directory.name} {repo['path']}: {err}", file=sys.stderr)
-                  continue
               section = config.get("version")
-              pattern = section.get("pattern", "") if isinstance(section, dict) else str(section or "")
-              version = clean_version(tag, pattern, [directory.name, *repo["path"].split("/")])
+              if isinstance(section, dict):
+                  # a mapping only carries the pattern that extracts the version from the tag
+                  pinned, pattern = "", section.get("pattern", "")
+              else:
+                  # a scalar version pins the version, the upstream release is not looked up at all
+                  pinned, pattern = str(section or "").strip(), ""
+              release = None
+              if pinned:
+                  tag, source = pinned, "project.yaml"
+                  print(f"::notice::{directory.name}: version {pinned} is pinned in project.yaml, "
+                        f"not looking the upstream version up", file=sys.stderr)
+              else:
+                  try:
+                      tag, source, release = latest_version(repo)
+                  except SystemExit as err:
+                      print(f"::error::{directory.name} {repo['path']}: {err}", file=sys.stderr)
+                      continue
+              version = pinned or clean_version(tag, pattern, [directory.name, *repo["path"].split("/")])
               print(f"::notice::{directory.name}: {repo['provider']} {source} {tag} -> version {version}",
                     file=sys.stderr)
 
