@@ -9,10 +9,8 @@ ENV TZ=Asia/Shanghai \
     DISCUZ_VERSION=${DISCUZ_VERSION}
 
 # 切换到 Debian 归档源（Buster 已 EOL）
-RUN sed -i 's/deb.debian.org/archive.debian.org/g' /etc/apt/sources.list \
-    && sed -i 's|security.debian.org|archive.debian.org|g' /etc/apt/sources.list \
-    && sed -i '/buster-updates/d' /etc/apt/sources.list \
-    && sed -i '/buster\/updates/d' /etc/apt/sources.list \
+RUN echo "deb http://archive.debian.org/debian buster main contrib non-free" > /etc/apt/sources.list \
+    && echo "deb http://archive.debian.org/debian-security buster/updates main contrib non-free" >> /etc/apt/sources.list \
     && echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
 
 # 安装必要组件
@@ -41,9 +39,9 @@ WORKDIR /var/www/html
 # 下载并解压 Discuz
 RUN set -eux; \
     wget -nv --tries=3 -O /tmp/discuz.zip "${DISCUZ_URL}"; \
-    && unzip /tmp/discuz.zip -d /tmp; \
-    && mv /tmp/upload/* /var/www/html/; \
-    && rm -rf /tmp/discuz.zip /tmp/upload; \
-    && chown -R www-data:www-data /var/www/html
+    unzip -q /tmp/discuz.zip -d /tmp; \
+    mv /tmp/upload/* /var/www/html/; \
+    rm -rf /tmp/discuz.zip /tmp/upload; \
+    chown -R www-data:www-data /var/www/html
 
 EXPOSE 80
