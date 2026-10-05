@@ -67,31 +67,123 @@ jobs:
         id: plan
         env:
           GH_TOKEN: ${{ github.token }}
+          GITLAB_TOKEN: ${{ vars.GITLAB_TOKEN }}
+          GITEE_TOKEN: ${{ vars.GITEE_TOKEN }}
           WANT: ${{ inputs.project }}
           IMAGE_PREFIX: ${{ env.REGISTRY }}/${{ github.actor }}
           FORCE: ${{ inputs.force }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, os, re, subprocess, sys, urllib.parse, urllib.request
+          import json, os, re, subprocess, sys, urllib.error, urllib.parse, urllib.request
           from pathlib import Path
 
           API = "https://api.github.com"
           PER_PAGE = 1
+          GITEE_PAGE = 100  # gitee does not sort releases or tags, the newest one has to be picked by date
+          PROVIDERS = ("github", "gitlab", "gitee")
+          TOKEN_ENV = {"github": ("GH_TOKEN", "GITHUB_TOKEN"),
+                       "gitlab": ("GITLAB_TOKEN", "GL_TOKEN"),
+                       "gitee": ("GITEE_TOKEN",)}
+          REPO_KEYS = ("github", "gitlab", "gitee", "git", "repo", "repository", "url", "source", "upstream")
+          URL_ARG_NAMES = ("GITHUB_URL", "GITLAB_URL", "GITEE_URL", "GIT_URL", "SOURCE_URL", "REPO_URL", "UPSTREAM_URL")
+          REPO_URL_RE = re.compile(
+              r"^(?:(?:https?|ssh|git)://)?(?:[^@/\s]+@)?(?P<host>[^:/\s]+)(?::\d+)?[:/]+(?P<path>[^#?\s]+?)/?$")
           SKIP_ASSET_RE = re.compile(r"\.(sha1|sha256|sha512|md5|sum|txt|asc|sig|log|deb|rpm|dmg|exe|msi|iso)$", re.I)
           ARG_RE = re.compile(r"^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)(?:=(\S*))?", re.M)
 
-          def api(path):
+          def pick_key(config, key):
+              """Read a config key case insensitively, an empty value counts as missing."""
+              for name in (key, key.capitalize(), key.upper()):
+                  value = config.get(name)
+                  if value not in (None, ""):
+                      return value
+              return ""
+
+          def detect_provider(host, declared=""):
+              name = str(declared or "").strip().lower()
+              if name:
+                  if name not in PROVIDERS:
+                      raise SystemExit(f"unknown provider {name!r}, use one of {', '.join(PROVIDERS)}")
+                  return name
+              low = str(host).lower()
+              for candidate in PROVIDERS:
+                  if candidate in low:
+                      return candidate
+              raise SystemExit(f"cannot tell the provider of host {host!r}: "
+                               "use a github:/gitlab:/gitee: key or set provider:")
+
+          def parse_repo(value, declared=""):
+              """Parse a github, gitlab or gitee repository URL into a descriptor dict."""
+              text = str(value).strip().strip("\"'")
+              match = REPO_URL_RE.match(text)
+              if not match:
+                  raise SystemExit(f"cannot parse a repository URL from {value!r}")
+              host = match.group("host")
+              parts = [part for part in match.group("path").split("/") if part]
+              if len(parts) < 2:
+                  raise SystemExit(f"{value!r} does not look like an owner/repo URL")
+              provider = detect_provider(host, declared)
+              if provider == "gitlab":
+                  path = "/".join(parts)
+                  api = f"https://{host}/api/v4"
+                  ref = urllib.parse.quote(path, safe="")
+                  releases = f"{api}/projects/{ref}/releases?per_page={PER_PAGE}"
+                  tags = f"{api}/projects/{ref}/repository/tags?per_page={PER_PAGE}"
+                  latest = ""
+              elif provider == "gitee":
+                  # gitee returns the releases oldest first and does not sort the tags at all, so a
+                  # single item page is useless there: read a full page and let latest_version sort it.
+                  path = f"{parts[0]}/{parts[1]}"
+                  api = f"https://{host}/api/v5"
+                  releases = f"{api}/repos/{path}/releases?per_page={GITEE_PAGE}"
+                  tags = f"{api}/repos/{path}/tags?per_page={GITEE_PAGE}"
+                  latest = f"{api}/repos/{path}/releases/latest"
+              else:
+                  path = f"{parts[0]}/{parts[1]}"
+                  api = API if "github.com" in host.lower() else f"https://{host}/api/v3"
+                  releases = f"{api}/repos/{path}/releases?per_page={PER_PAGE}"
+                  tags = f"{api}/repos/{path}/tags?per_page={PER_PAGE}"
+                  latest = ""
+              web = f"https://{host}/{path}"
+              return {"provider": provider, "host": host, "path": path, "web": web,
+                      "clone": f"{web}.git", "api": api, "releases": releases, "tags": tags, "latest": latest}
+
+          def repo_of(config):
+              """Return the repository descriptor declared in project.yaml, None when there is none."""
+              declared = pick_key(config, "provider")
+              problems = []
+              for key in REPO_KEYS:
+                  value = pick_key(config, key)
+                  if value in (None, ""):
+                      continue
+                  try:
+                      return parse_repo(value, declared)
+                  except SystemExit as err:
+                      problems.append(str(err))
+              if problems:
+                  raise SystemExit("; ".join(problems))
+              return None
+
+          def api(url, provider):
               headers = {"Accept": "application/vnd.github+json", "User-Agent": "docker-publish"}
-              token = os.environ.get("GH_TOKEN", "")
+              if provider == "github":
+                  headers["X-GitHub-Api-Version"] = "2022-11-28"
+              token = next((os.environ.get(name) for name in TOKEN_ENV[provider] if os.environ.get(name)), "")
               if token:
-                  headers["Authorization"] = f"Bearer {token}"
-              request = urllib.request.Request(API + path, headers=headers)
+                  if provider == "gitlab":
+                      headers["PRIVATE-TOKEN"] = token
+                  elif provider == "gitee":
+                      headers["Authorization"] = f"token {token}"
+                  else:
+                      headers["Authorization"] = f"Bearer {token}"
+              request = urllib.request.Request(url, headers=headers)
               with urllib.request.urlopen(request, timeout=60) as response:
                   return json.load(response)
 
           def read_config(path):
-              """Read enable / GitHub / version.pattern from project.yaml without depending on pyyaml."""
+              """Read enable / repository (github, gitlab, gitee) / version.pattern from project.yaml
+              without depending on pyyaml."""
               config, section = {}, None
               for raw in path.read_text(encoding="utf-8").splitlines():
                   line = raw.split("#", 1)[0].rstrip()
@@ -165,14 +257,59 @@ jobs:
               version = tag.split("#", 1)[0].strip() if "#" in tag else tag.strip()
               return strip_prefix(version, names)
 
-          def latest_version(owner, repo):
-              releases = api(f"/repos/{owner}/{repo}/releases?per_page={PER_PAGE}")
-              usable = [r for r in releases if not r.get("draft") and not r.get("prerelease")]
+          def release_entry(item, provider):
+              """Normalize a github, gitlab or gitee release payload."""
+              assets = []
+              if provider == "gitlab":
+                  for link in (item.get("assets") or {}).get("links") or []:
+                      assets.append({"name": link.get("name") or "",
+                                     "url": link.get("direct_asset_url") or link.get("url") or ""})
+              else:
+                  for asset in item.get("assets") or []:
+                      assets.append({"name": asset.get("name") or "", "url": asset.get("browser_download_url") or ""})
+              return {"tag": item.get("tag_name") or "", "draft": bool(item.get("draft")),
+                      "prerelease": bool(item.get("prerelease")), "assets": assets, "raw": item}
+
+          def tag_date(item):
+              """Return the date of a tag payload, gitee does not order its tag list."""
+              return str((item.get("tagger") or {}).get("date") or (item.get("commit") or {}).get("date") or "")
+
+          def latest_version(repo):
+              provider = repo["provider"]
+              usable = []
+              if repo["latest"]:
+                  # gitee /releases/latest is the newest published one, its list endpoint is oldest first
+                  try:
+                      payload = api(repo["latest"], provider)
+                  except urllib.error.HTTPError as err:
+                      print(f"::notice::{repo['path']}: releases/latest returned {err.code}, "
+                            "falling back to the release list", file=sys.stderr)
+                      payload = None
+                  entry = release_entry(payload, provider) if isinstance(payload, dict) else None
+                  if entry and entry["tag"] and not entry["draft"] and not entry["prerelease"]:
+                      usable.append(entry)
+              if not usable:
+                  payload = api(repo["releases"], provider)
+                  items = payload if isinstance(payload, list) else []
+                  if provider == "gitee":
+                      items = sorted(items, key=lambda item: str(item.get("created_at") or ""), reverse=True)
+                  for item in items:
+                      entry = release_entry(item, provider)
+                      if entry["tag"] and not entry["draft"] and not entry["prerelease"]:
+                          usable.append(entry)
+                  if usable and provider == "gitee":
+                      print(f"::notice::the gitee release list is not ordered, picked {usable[0]['tag']} "
+                            "as the newest one by date", file=sys.stderr)
               if usable:
-                  return usable[0]["tag_name"], "release", usable[0]
-              tags = [t.get("name") for t in api(f"/repos/{owner}/{repo}/tags?per_page={PER_PAGE}") if t.get("name")]
+                  return usable[0]["tag"], "release", usable[0]
+              payload = api(repo["tags"], provider)
+              items = payload if isinstance(payload, list) else []
+              if provider == "gitee":
+                  items = sorted(items, key=tag_date, reverse=True)
+              tags = [item.get("name") for item in items if isinstance(item, dict) and item.get("name")]
+              tags = [tag for tag in tags if re.match(r"^v?\d", tag)] or tags
               if not tags:
-                  raise SystemExit(f"{owner}/{repo} has neither releases nor tags")
+                  raise SystemExit(f"{repo['path']} has neither releases nor tags")
               return tags[0], "tag", None
 
           def preferred_ext(text):
@@ -184,12 +321,15 @@ jobs:
                   return ".tar.gz"
               return ""
 
-          def asset_url(release, tag, version, project, repo, ext):
-              repo_key, project_key = normalize(repo.split("/")[-1]), normalize(project)
+          def asset_url(release, repo, tag, version, project, ext):
+              """Return the download url for a *_URL build arg: the release attachment that matches
+              the repo name and the version, else the source archive of the tag (not for gitee, its
+              archive endpoints answer with an HTML page)."""
+              repo_key, project_key = normalize(repo["path"].split("/")[-1]), normalize(project)
               version_key = normalize(version)
               best, best_score = "", 0
               for asset in (release or {}).get("assets") or []:
-                  name, url = asset.get("name") or "", asset.get("browser_download_url") or ""
+                  name, url = str(asset.get("name") or ""), str(asset.get("url") or "")
                   if not url or SKIP_ASSET_RE.search(name):
                       continue
                   if ext and not name.lower().endswith(ext):
@@ -203,25 +343,37 @@ jobs:
                   if score > best_score:
                       best, best_score = url, score
               if best_score >= 3:
-                  return best
-              release = release or {}
+                  return best, True
+              raw = (release or {}).get("raw") or {}
               quoted = urllib.parse.quote(tag, safe="/")
-              if ext == ".zip":
-                  return release.get("zipball_url") or f"https://github.com/{repo}/archive/refs/tags/{quoted}.zip"
-              return release.get("tarball_url") or f"https://github.com/{repo}/archive/refs/tags/{quoted}.tar.gz"
+              if repo["provider"] == "github":
+                  if ext == ".zip":
+                      return (raw.get("zipball_url")
+                              or f"{repo['web']}/archive/refs/tags/{quoted}.zip"), False
+                  return (raw.get("tarball_url")
+                          or f"{repo['web']}/archive/refs/tags/{quoted}.tar.gz"), False
+              if repo["provider"] != "gitlab":
+                  return "", False
+              name = quoted.rsplit("/", 1)[-1]
+              stem = urllib.parse.quote(f"{repo['path'].split('/')[-1]}-{name}")
+              suffix = ".zip" if ext == ".zip" else ".tar.gz"
+              return f"{repo['web']}/-/archive/{quoted}/{stem}{suffix}", False
 
-          def guess_args(text, url, version, tag, repo):
+          def guess_args(text, url, from_asset, version, tag, repo):
               guessed = {}
               for name, default in ARG_RE.findall(text):
                   upper = name.upper()
                   if upper.endswith(("_VERSION", "_VERSION_TAG")) or upper == "VERSION":
                       guessed[name] = version
-                  elif upper in ("GITHUB_URL", "SOURCE_URL", "REPO_URL") or upper.endswith("_REPO_URL"):
-                      guessed[name] = f"https://github.com/{repo}"
+                  elif upper in URL_ARG_NAMES or upper.endswith("_REPO_URL"):
+                      guessed[name] = repo["web"]
                   elif upper.endswith(("_TAG", "_REF")) and not default:
                       guessed[name] = tag
-                  elif upper.endswith(("_URL", "_DOWNLOAD_URL", "_SRC_URL", "_ARCHIVE_URL")) and not default:
-                      guessed[name] = url
+                  elif upper.endswith(("_URL", "_DOWNLOAD_URL", "_SRC_URL", "_ARCHIVE_URL")):
+                      # a release attachment that matched the version replaces a hardcoded default,
+                      # a made up archive url never does
+                      if url and (not default or from_asset):
+                          guessed[name] = url
               return guessed
 
           root = Path(os.environ["GITHUB_WORKSPACE"])
@@ -242,17 +394,25 @@ jobs:
               if not enabled(config.get("enable", config.get("enabled"))):
                   print(f"::notice::{directory.name} is disabled (enable false), skipping", file=sys.stderr)
                   continue
-              url = config.get("GitHub") or config.get("github") or ""
-              match = re.search(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?$", url.strip())
-              if not match:
-                  print(f"::error::{directory.name}/project.yaml does not declare a GitHub repository", file=sys.stderr)
+              try:
+                  repo = repo_of(config)
+              except SystemExit as err:
+                  print(f"::error::{directory.name}/project.yaml: {err}", file=sys.stderr)
                   continue
-              owner, repo = match.group(1), match.group(2)
-              tag, source, release = latest_version(owner, repo)
+              if not repo:
+                  print(f"::error::{directory.name}/project.yaml does not declare a repository "
+                        f"(use a github:, gitlab:, gitee: or git: key)", file=sys.stderr)
+                  continue
+              try:
+                  tag, source, release = latest_version(repo)
+              except SystemExit as err:
+                  print(f"::error::{directory.name} {repo['path']}: {err}", file=sys.stderr)
+                  continue
               section = config.get("version")
               pattern = section.get("pattern", "") if isinstance(section, dict) else str(section or "")
-              version = clean_version(tag, pattern, [directory.name, owner, repo])
-              print(f"::notice::{directory.name}: {source} {tag} -> version {version}", file=sys.stderr)
+              version = clean_version(tag, pattern, [directory.name, *repo["path"].split("/")])
+              print(f"::notice::{directory.name}: {repo['provider']} {source} {tag} -> version {version}",
+                    file=sys.stderr)
 
               # Compare the published version with the latest release and only keep the project
               # when it is out of date. The version label of the multi-arch :latest image cannot be
@@ -271,14 +431,16 @@ jobs:
                       print(f"::notice::{directory.name}: {image}:{version} is already published, skipping", file=sys.stderr)
                       continue
 
-              entry = {"project": directory.name, "repo": f"{owner}/{repo}", "version": version, "tag": tag,
-                       "source": source, "dockerfile": "", "build_args": {}}
+              entry = {"project": directory.name, "provider": repo["provider"], "repo": repo["path"],
+                       "version": version, "tag": tag, "source": source, "web": repo["web"],
+                       "clone": repo["clone"], "dockerfile": "", "build_args": {}}
               dockerfiles = sorted(p for p in directory.glob("Dockerfile*") if p.is_file())
               if dockerfiles:
                   text = dockerfiles[0].read_text(encoding="utf-8", errors="replace")
-                  download = asset_url(release, tag, version, directory.name, entry["repo"], preferred_ext(text))
+                  download, from_asset = asset_url(release, repo, tag, version, directory.name,
+                                                    preferred_ext(text))
                   entry["dockerfile"] = str(dockerfiles[0].relative_to(root))
-                  entry["build_args"] = guess_args(text, download, version, tag, entry["repo"])
+                  entry["build_args"] = guess_args(text, download, from_asset, version, tag, repo)
               matrix.append(entry)
 
           print("matrix=" + json.dumps(matrix, ensure_ascii=False))
@@ -314,6 +476,8 @@ jobs:
         env:
           PROJECT: ${{ matrix.target.project }}
           REPO: ${{ matrix.target.repo }}
+          WEB: ${{ matrix.target.web }}
+          CLONE: ${{ matrix.target.clone }}
           VERSION: ${{ matrix.target.version }}
           TAG: ${{ matrix.target.tag }}
           SOURCE: ${{ matrix.target.source }}
@@ -326,7 +490,7 @@ jobs:
 
           args=(--label "org.opencontainers.image.title=$PROJECT"
                 --label "org.opencontainers.image.version=$VERSION"
-                --label "org.opencontainers.image.source=https://github.com/$REPO"
+                --label "org.opencontainers.image.source=$WEB"
                 --tag "$image:$VERSION"
                 --tag "$image:latest")
 
@@ -334,7 +498,7 @@ jobs:
             context="."
           else
             context=".build/$PROJECT"
-            git clone --depth 1 --branch "$TAG" "https://github.com/$REPO.git" "$context"
+            git clone --depth 1 --branch "$TAG" "$CLONE" "$context"
             DOCKERFILE="$(find "$context" -maxdepth 1 -name 'Dockerfile*' -type f | head -1)"
           fi
           args+=(--file "$DOCKERFILE" "$context")

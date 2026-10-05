@@ -1,8 +1,7 @@
-# 基础镜像可用 --build-arg DISCUZ_BASE=php:8.3-apache 覆盖
-ARG DISCUZ_BASE=php:8.4-apache
-FROM ${DISCUZ_BASE}
+ARG BASE_IMAGE=php:8.4-apache
+FROM ${BASE_IMAGE}
 
-# 由 CI 传入（见 ci/projects.json），本地构建从 .env 读取
+# 本地构建从 .env 读取
 ARG DISCUZ_URL
 ARG DISCUZ_VERSION=unknown
 
@@ -32,7 +31,7 @@ RUN a2enmod rewrite \
 
 WORKDIR /var/www/html
 
-# 压缩包顶层目录名不固定（upload/、Discuz_X5.0_.../ 或直接就是文件），
+# 压缩包顶层目录名不固定（upload/、Discuz_.../ 或直接就是文件），
 # 这里按 install 目录 / 配置文件定位真正的站点根目录
 RUN set -eux; \
     mkdir -p /tmp/extract; \

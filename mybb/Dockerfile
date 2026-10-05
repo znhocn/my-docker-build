@@ -1,8 +1,7 @@
-# 基础镜像可用 --build-arg MYBB_BASE=php:8.2-apache 覆盖
-ARG MYBB_BASE=php:8.1-apache
-FROM ${MYBB_BASE}
+ARG BASE_IMAGE=php:8.1-apache
+FROM ${BASE_IMAGE}
 
-# 由 CI 传入（见 ci/projects.json），本地构建从 .env 读取
+# 本地构建从 .env 读取
 ARG MYBB_URL
 ARG MYBB_VERSION=unknown
 
@@ -26,7 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && docker-php-ext-install gd mysqli pdo pdo_mysql zip mbstring xml curl opcache \
     && rm -rf /var/lib/apt/lists/*
 
-# 启用 Apache 伪静态模块 (mod_rewrite)
+# 开启 Apache rewrite，并设置时区
 RUN a2enmod rewrite \
     && sed -i 's/AllowOverride None/AllowOverride All/' /etc/apache2/apache2.conf \
     && ln -sf /usr/share/zoneinfo/${TZ} /etc/localtime \

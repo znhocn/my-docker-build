@@ -2,7 +2,7 @@
 
 把几个上游项目的官方源码包/镜像打包成 Docker 镜像，每天定时检查上游 release，有新版本才重新构建并推送。
 
-仓库根目录的 `build-latest.py` 用于**本地构建**：读各子项目的 `project.yaml`，取 GitHub 最新 release 版本，用该版本重新构建镜像，不推送远端。
+仓库根目录的 `build-latest.py` 用于**本地构建**：读各子项目的 `project.yaml`，取上游（GitHub / GitLab / Gitee）最新 release 版本，用该版本重新构建镜像，不推送远端。
 镜像的自动构建与发布由 `.github/workflows/docker-build.yml` 独立完成，它不调用 `build-latest.py`。
 
 ## 配置
@@ -11,7 +11,7 @@
 
 ```yaml
 enable: true                              # false 时检查和构建都跳过，不写默认启用
-GitHub: https://github.com/mybb/mybb      # 上游仓库
+GitHub: https://github.com/mybb/mybb      # 上游仓库，GitLab / Gitee 写法见下
 version:                                  # 可选：从 tag 里提取版本号
   pattern: '[0-9]+\.[0-9]+[-_.][0-9]{8}'  # 例：tag 为 X5.0-20261001#2 时版本号取 5.0-20261001
 ```
@@ -19,15 +19,35 @@ version:                                  # 可选：从 tag 里提取版本号
 - 版本号默认去掉 tag 里的构建号（`X5.0-20261001#2` → `X5.0-20261001`），需要别的规则就写 `version.pattern`。
 - 镜像标签：上游版本号 + `latest`。
 
+### 上游仓库：GitHub / GitLab / Gitee
+
+按平台选一个键，键名大小写都认：
+
+```yaml
+GitHub: https://github.com/owner/repo             # GitHub（企业版用 https://github.公司域名/owner/repo）
+GitLab: https://gitlab.com/group/subgroup/repo    # GitLab，允许多级 group
+Gitee:  https://gitee.com/owner/repo              # Gitee
+git:    https://git.公司域名/team/repo            # 平台不认域名时，配一行 provider: gitlab
+```
+
+- 平台按域名自动判断：`github` / `gitlab` / `gitee`；域名看不出来时用 `provider: github|gitlab|gitee` 指定。
+- 也兼容通用的 `repo` / `repository` / `url` / `source` / `upstream` 键，此时同样按域名判断平台。
+- 认证（可选，公开仓库不用配）：GitHub 读 `GH_TOKEN` / `GITHUB_TOKEN`，GitLab 读 `GITLAB_TOKEN`，Gitee 读 `GITEE_TOKEN`。
+- workflow 里 GitLab / Gitee 的 token 从仓库变量 `GITLAB_TOKEN` / `GITEE_TOKEN` 取（不是 secret），GitHub 直接用自动生成的 `github.token`。
+- API 路径：GitHub `api.github.com/repos/{owner}/{repo}`（企业版 `/api/v3`），GitLab `/api/v4/projects/{url编码的路径}`，Gitee `/api/v5/repos/{owner}/{repo}`。
+- **Gitee 的坑**：`/releases` 列表是按创建时间**升序**返回的，`/tags` 完全不按时间排序，所以取版本走 `/releases/latest`，并在列表/兜底路径上按 `created_at`、`tagger.date` 自己降序（这两个接口 `per_page=100`）；该端点 404 时自动退回列表。
+- Gitee 的 `/archive/`、`/repository/archive/` 返回的是 HTML 页面而不是压缩包，所以 Gitee 项目不拼源码包地址：只用 release 附件，没有附件就用 Dockerfile 里的默认值。
+- 附件：GitHub / Gitee 读 release 的 `assets[].browser_download_url`，GitLab 读 `assets.links[].direct_asset_url`；没有合适附件时按平台拼源码包地址（GitHub `/archive/refs/tags/`、GitLab `/-/archive/`、Gitee `/repository/archive/`）。
+
 Dockerfile 里的构建参数按 `ARG` 名自动推断，不用额外配置：
 
 | Dockerfile 里的 ARG | 传入的值 |
 | --- | --- |
 | `*_VERSION` | 上游版本号 |
 | `*_TAG` / `*_REF` | 上游 tag |
-| `GITHUB_URL` / `*_REPO_URL` | 上游仓库地址 |
+| `GITHUB_URL` / `GITLAB_URL` / `GITEE_URL` / `GIT_URL` / `*_REPO_URL` | 上游仓库地址 |
 | `*_URL` / `*_DOWNLOAD_URL` / `*_SRC_URL` | release 附件（按 Dockerfile 用的解压格式 + 仓库名匹配，例如 `unzip` 就找 `.zip`），没有合适附件就用该 tag 的源码压缩包 |
-| `*_BASE` | 保持 Dockerfile 里的默认值 |
+| `BASE_IMAGE` | 保持 Dockerfile 里的默认值 |
 | 其他 | 不传，用 Dockerfile 里的默认值 |
 
 `--build-arg K=V` 可以覆盖任意一项。

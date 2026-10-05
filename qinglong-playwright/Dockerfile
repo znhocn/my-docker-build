@@ -6,10 +6,9 @@
 #    （HOME=/home/qinglong），构建阶段 HOME=/root。
 # 2. 通过 PLAYWRIGHT_BROWSERS_PATH 将浏览器固定到共享目录，
 #    并系统级安装 playwright，供 qinglong 任务直接 import。
-# 3. 基础镜像版本由 CI 按上游 release 传入（见 ci/projects.json），
-#    上游没有对应版本 tag 时回落到 debian。
-ARG QINGLONG_BASE=ghcr.io/whyour/qinglong:debian
-FROM ${QINGLONG_BASE}
+# 3. 基础镜像可用 BASE_IMAGE 覆盖，默认保持 debian 变体。
+ARG BASE_IMAGE=ghcr.io/whyour/qinglong:debian
+FROM ${BASE_IMAGE}
 
 ARG QINGLONG_VERSION=unknown
 ENV QINGLONG_VERSION=${QINGLONG_VERSION}

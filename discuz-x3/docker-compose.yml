@@ -1,13 +1,13 @@
 services:
-  mybb:
+  discuz:
     build:
       context: .
       args:
-        BASE_IMAGE: ${BASE_IMAGE:-php:8.1-apache}
-        MYBB_URL: ${MYBB_URL}
-        MYBB_VERSION: ${MYBB_VER:-unknown}
-    image: mybb:${MYBB_VER}
-    container_name: mybb
+        BASE_IMAGE: ${BASE_IMAGE:-php:7.4-apache}
+        DISCUZ_URL: ${DISCUZ_URL}
+        DISCUZ_VERSION: ${DISCUZ_VER:-unknown}
+    image: discuz:${DISCUZ_VER}
+    container_name: discuz
     restart: unless-stopped
     depends_on:
       - mysql
@@ -19,14 +19,14 @@ services:
       - "${HTTP_PORT:-8080}:80"
 
   mysql:
-    image: mysql:8.0
-    container_name: mybb-db
+    image: mysql:5.7
+    container_name: discuz-db
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-RootPassword123}
-      MYSQL_DATABASE: ${MYSQL_DATABASE:-mybb}
-      MYSQL_USER: ${MYSQL_USER:-mybb}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-MybbStrongPass123}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-discuz}
+      MYSQL_USER: ${MYSQL_USER:-discuz}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-DiscuzStrongPass123}
     volumes:
       - db:/var/lib/mysql
 
