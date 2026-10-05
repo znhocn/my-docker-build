@@ -425,6 +425,7 @@ jobs:
               else:
                   dockerfiles = sorted(p for p in directory.glob("Dockerfile*") if p.is_file())
                   if dockerfiles:
+                      entry["source_dir"] = entry["context"] = rel(dockerfiles[0].parent)
                       entry["dockerfile"], entry["guess"] = rel(dockerfiles[0]), True
                   else:
                       entry["clone"] = True
