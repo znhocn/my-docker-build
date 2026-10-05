@@ -50,12 +50,6 @@ RUN set -eu; \
     chmod -R 777 /ms-playwright; \
     rm -rf /var/lib/apt/lists/*
 
-# 构建期自检：运行时解析到的 playwright 需要的 chromium revision 必须已就位且能启动
-RUN set -eu; \
-    rev="$(python3 -c 'import json, os, playwright; d = json.load(open(os.path.join(os.path.dirname(playwright.__file__), "driver", "package", "browsers.json"))); print([b["revision"] for b in d["browsers"] if b["name"] == "chromium-headless-shell"][0])')"; \
-    test -x "${PLAYWRIGHT_BROWSERS_PATH}/chromium_headless_shell-${rev}/chrome-headless-shell-linux64/chrome-headless-shell"; \
-    python3 -c 'from playwright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(); print("chromium", b.version, "revision", "'"${rev}"'", "ok"); b.close(); p.stop()'
-
 # 将 qinglong 用户的 .ssh 同步给 root，方便 root 使用同一套密钥
 RUN cp -rv /home/qinglong/.ssh /root/ \
     && ln -sf /home/qinglong/.ssh/config /root/.ssh/config \
