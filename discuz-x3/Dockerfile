@@ -8,6 +8,13 @@ ARG DISCUZ_VERSION="3.5-20260504"
 ENV TZ=Asia/Shanghai \
     DISCUZ_VERSION=${DISCUZ_VERSION}
 
+# 切换到 Debian 归档源（Buster 已 EOL）
+RUN sed -i 's/deb.debian.org/archive.debian.org/g' /etc/apt/sources.list \
+    && sed -i 's|security.debian.org|archive.debian.org|g' /etc/apt/sources.list \
+    && sed -i '/buster-updates/d' /etc/apt/sources.list \
+    && sed -i '/buster\/updates/d' /etc/apt/sources.list \
+    && echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
+
 # 安装必要组件
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
