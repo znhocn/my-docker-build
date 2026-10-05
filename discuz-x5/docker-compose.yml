@@ -1,0 +1,35 @@
+services:
+  discuz-x5:
+    build:
+      context: .
+      args:
+        DISCUZ_BASE: ${DISCUZ_BASE:-php:8.4-apache}
+        DISCUZ_URL: ${DISCUZ_URL}
+        DISCUZ_VERSION: ${DISCUZ_VER:-unknown}
+    image: discuz:${DISCUZ_VER}
+    container_name: discuz-x5
+    restart: unless-stopped
+    depends_on:
+      - mysql
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - data:/var/www/html
+    ports:
+      - "${HTTP_PORT:-80}:80"
+
+  mysql:
+    image: mysql:8.0
+    container_name: discuz-x5-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-RootPassword123}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-discuz}
+      MYSQL_USER: ${MYSQL_USER:-discuz}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-DiscuzStrongPass123}
+    volumes:
+      - db:/var/lib/mysql
+
+volumes:
+  data:
+  db:

@@ -1,0 +1,25 @@
+services:
+  qinglong:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        QINGLONG_BASE: ${QINGLONG_BASE:-ghcr.io/whyour/qinglong:debian}
+        QINGLONG_VERSION: ${QINGLONG_VER:-unknown}
+    image: qinglong-playwright:latest
+    # image: ghcr.io/whyour/qinglong:latest
+    # image: ghcr.io/whyour/qinglong:debian
+    # image: ghcr.io/whyour/qinglong:2.15.14
+    container_name: qinglong
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "5700:5700"
+    volumes:
+      - data:/ql/data
+      # - "${HOME}/.ssh/id_rsa:/root/.ssh/id_rsa:ro"
+      # - "${HOME}/.ssh/id_ed25519:/root/.ssh/id_ed25519:ro"
+
+volumes:
+  data:

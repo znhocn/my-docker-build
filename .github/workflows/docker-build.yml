@@ -1,0 +1,309 @@
+name: Docker Build and Publish
+
+# Standalone publish pipeline: it never calls the repository's build-latest.py,
+# it resolves upstream release versions and publishes multi-platform images to GHCR on its own.
+on:
+  schedule:
+    # 04:00 UTC every day
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      project:
+        description: Projects to build, comma separated (empty or all means every project; use the subdirectory names)
+        type: string
+        default: all
+      platforms:
+        description: Target platforms, comma separated (defaults to linux/amd64,linux/arm64)
+        type: string
+        default: ""
+      force:
+        description: Rebuild even if the remote registry already has this version
+        type: boolean
+        default: false
+      dry_run:
+        description: Only resolve versions and print the plan, do not build or push
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: ghcr.io
+  PLATFORMS: ${{ inputs.platforms || 'linux/amd64,linux/arm64' }}
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  # never cancel a publish halfway, that would leave a partial set of images
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  plan:
+    name: Resolve upstream versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Build the plan
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WANT: ${{ inputs.project }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, re, sys, urllib.parse, urllib.request
+          from pathlib import Path
+
+          API = "https://api.github.com"
+          PER_PAGE = 1
+          SKIP_ASSET_RE = re.compile(r"\.(sha1|sha256|sha512|md5|sum|txt|asc|sig|log|deb|rpm|dmg|exe|msi|iso)$", re.I)
+          ARG_RE = re.compile(r"^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)(?:=(\S*))?", re.M)
+
+          def api(path):
+              headers = {"Accept": "application/vnd.github+json", "User-Agent": "docker-publish"}
+              token = os.environ.get("GH_TOKEN", "")
+              if token:
+                  headers["Authorization"] = f"Bearer {token}"
+              request = urllib.request.Request(API + path, headers=headers)
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+
+          def read_config(path):
+              """Read enable / GitHub / version.pattern from project.yaml without depending on pyyaml."""
+              config, section = {}, None
+              for raw in path.read_text(encoding="utf-8").splitlines():
+                  line = raw.split("#", 1)[0].rstrip()
+                  if not line.strip():
+                      continue
+                  if line[:1] in (" ", "\t"):
+                      key, _, value = line.strip().partition(":")
+                      if section and value.strip():
+                          config.setdefault(section, {})[key.strip()] = value.strip().strip("'\"")
+                      continue
+                  section = None
+                  key, _, value = line.partition(":")
+                  key, value = key.strip().strip("'\""), value.strip().strip("'\"")
+                  if value:
+                      config[key] = value
+                  else:
+                      section = key
+              return config
+
+          def enabled(value):
+              if value is None:
+                  return True
+              return str(value).strip().lower() in ("true", "yes", "on", "1", "y")
+
+          def normalize(text):
+              return re.sub(r"[^a-z0-9]+", "", str(text).lower())
+
+          def strip_prefix(version, names):
+              """Strip a repeated project/repo name prefix from a tag, v is kept: mybb_1841 -> 1841."""
+              known = sorted({n for n in names if n}, key=len, reverse=True)
+              while version:
+                  hit = None
+                  for name in known:
+                      match = re.match(rf"{re.escape(name)}[-_.:/ ]*", version, re.I)
+                      if match and match.end() < len(version):
+                          hit = match
+                          break
+                  if hit is None:
+                      break
+                  rest = version[hit.end():]
+                  if re.match(r"[vV]?\d", rest):
+                      return rest
+                  version = rest
+              return version
+
+          def clean_version(tag, pattern, names):
+              if pattern:
+                  try:
+                      match = re.search(pattern, tag)
+                  except re.error:
+                      match = None
+                  if match:
+                      groups = [g for g in match.groups() if g]
+                      return groups[0] if groups else match.group(0)
+                  print(f"::warning::tag {tag} does not match pattern {pattern}, using the tag name", file=sys.stderr)
+              version = tag.split("#", 1)[0].strip() if "#" in tag else tag.strip()
+              return strip_prefix(version, names)
+
+          def latest_version(owner, repo):
+              releases = api(f"/repos/{owner}/{repo}/releases?per_page={PER_PAGE}")
+              usable = [r for r in releases if not r.get("draft") and not r.get("prerelease")]
+              if usable:
+                  return usable[0]["tag_name"], "release", usable[0]
+              tags = [t.get("name") for t in api(f"/repos/{owner}/{repo}/tags?per_page={PER_PAGE}") if t.get("name")]
+              if not tags:
+                  raise SystemExit(f"{owner}/{repo} has neither releases nor tags")
+              return tags[0], "tag", None
+
+          def preferred_ext(text):
+              zip_like = bool(re.search(r"unzip|\bunar\b|\b7z\b", text))
+              tar_like = bool(re.search(r"\btar\b|gunzip", text))
+              if zip_like and not tar_like:
+                  return ".zip"
+              if tar_like and not zip_like:
+                  return ".tar.gz"
+              return ""
+
+          def asset_url(release, tag, version, project, repo, ext):
+              repo_key, project_key = normalize(repo.split("/")[-1]), normalize(project)
+              version_key = normalize(version)
+              best, best_score = "", 0
+              for asset in (release or {}).get("assets") or []:
+                  name, url = asset.get("name") or "", asset.get("browser_download_url") or ""
+                  if not url or SKIP_ASSET_RE.search(name):
+                      continue
+                  if ext and not name.lower().endswith(ext):
+                      continue
+                  flat = normalize(name)
+                  score = 0
+                  if (repo_key and repo_key in flat) or (project_key and project_key in flat):
+                      score += 3
+                  if version_key and version_key in flat:
+                      score += 1
+                  if score > best_score:
+                      best, best_score = url, score
+              if best_score >= 3:
+                  return best
+              release = release or {}
+              quoted = urllib.parse.quote(tag, safe="/")
+              if ext == ".zip":
+                  return release.get("zipball_url") or f"https://github.com/{repo}/archive/refs/tags/{quoted}.zip"
+              return release.get("tarball_url") or f"https://github.com/{repo}/archive/refs/tags/{quoted}.tar.gz"
+
+          def guess_args(text, url, version, tag, repo):
+              guessed = {}
+              for name, default in ARG_RE.findall(text):
+                  upper = name.upper()
+                  if upper.endswith(("_VERSION", "_VERSION_TAG")) or upper == "VERSION":
+                      guessed[name] = version
+                  elif upper in ("GITHUB_URL", "SOURCE_URL", "REPO_URL") or upper.endswith("_REPO_URL"):
+                      guessed[name] = f"https://github.com/{repo}"
+                  elif upper.endswith(("_TAG", "_REF")) and not default:
+                      guessed[name] = tag
+                  elif upper.endswith(("_URL", "_DOWNLOAD_URL", "_SRC_URL", "_ARCHIVE_URL")) and not default:
+                      guessed[name] = url
+              return guessed
+
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          projects = [p for p in sorted(root.iterdir())
+                      if p.is_dir() and not p.name.startswith(".") and (p / "project.yaml").is_file()]
+          want = os.environ.get("WANT", "all").strip()
+          if want and want != "all":
+              picked = {n.strip() for n in want.split(",") if n.strip()}
+              missing = picked - {p.name for p in projects}
+              if missing:
+                  raise SystemExit(f"no such project: {', '.join(sorted(missing))}")
+              projects = [p for p in projects if p.name in picked]
+
+          matrix = []
+          for directory in projects:
+              config = read_config(directory / "project.yaml")
+              if not enabled(config.get("enable", config.get("enabled"))):
+                  print(f"::notice::{directory.name} is disabled (enable false), skipping", file=sys.stderr)
+                  continue
+              url = config.get("GitHub") or config.get("github") or ""
+              match = re.search(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?$", url.strip())
+              if not match:
+                  print(f"::error::{directory.name}/project.yaml does not declare a GitHub repository", file=sys.stderr)
+                  continue
+              owner, repo = match.group(1), match.group(2)
+              tag, source, release = latest_version(owner, repo)
+              section = config.get("version")
+              pattern = section.get("pattern", "") if isinstance(section, dict) else str(section or "")
+              version = clean_version(tag, pattern, [directory.name, owner, repo])
+              print(f"::notice::{directory.name}: {source} {tag} -> version {version}", file=sys.stderr)
+
+              entry = {"project": directory.name, "repo": f"{owner}/{repo}", "version": version, "tag": tag,
+                       "source": source, "dockerfile": "", "build_args": {}}
+              dockerfiles = sorted(p for p in directory.glob("Dockerfile*") if p.is_file())
+              if dockerfiles:
+                  text = dockerfiles[0].read_text(encoding="utf-8", errors="replace")
+                  download = asset_url(release, tag, version, directory.name, entry["repo"], preferred_ext(text))
+                  entry["dockerfile"] = str(dockerfiles[0].relative_to(root))
+                  entry["build_args"] = guess_args(text, download, version, tag, entry["repo"])
+              matrix.append(entry)
+
+          print("matrix=" + json.dumps(matrix, ensure_ascii=False))
+          PY
+
+  build:
+    name: Build ${{ matrix.target.project }}
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: all
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        env:
+          PROJECT: ${{ matrix.target.project }}
+          REPO: ${{ matrix.target.repo }}
+          VERSION: ${{ matrix.target.version }}
+          TAG: ${{ matrix.target.tag }}
+          SOURCE: ${{ matrix.target.source }}
+          DOCKERFILE: ${{ matrix.target.dockerfile }}
+          BUILD_ARGS: ${{ toJSON(matrix.target.build_args) }}
+        run: |
+          set -euo pipefail
+          image="$REGISTRY/${{ github.actor }}/$PROJECT"
+          echo "$image:$VERSION (source: $SOURCE $TAG)"
+
+          args=(--label "org.opencontainers.image.title=$PROJECT"
+                --label "org.opencontainers.image.version=$VERSION"
+                --label "org.opencontainers.image.source=https://github.com/$REPO"
+                --tag "$image:$VERSION"
+                --tag "$image:latest")
+
+          if [ -n "$DOCKERFILE" ]; then
+            context="."
+          else
+            context=".build/$PROJECT"
+            git clone --depth 1 --branch "$TAG" "https://github.com/$REPO.git" "$context"
+            DOCKERFILE="$(find "$context" -maxdepth 1 -name 'Dockerfile*' -type f | head -1)"
+          fi
+          args+=(--file "$DOCKERFILE" "$context")
+
+          while IFS= read -r pair; do
+            [ -n "$pair" ] && args+=(--build-arg "$pair")
+          done < <(python3 -c 'import json,sys;print("\n".join(f"{k}={v}" for k,v in json.load(sys.stdin).items()))' <<< "$BUILD_ARGS")
+
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "docker buildx build ${args[*]} --platform $PLATFORMS --push"
+            exit 0
+          fi
+
+          if [ "${{ inputs.force }}" != "true" ] && docker buildx imagetools inspect "$image:$VERSION" >/dev/null 2>&1; then
+            echo "$PROJECT:$VERSION already exists on the registry, skipping (tick force to rebuild)"
+            exit 0
+          fi
+
+          docker buildx build "${args[@]}" --platform "$PLATFORMS" --push

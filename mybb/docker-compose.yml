@@ -1,0 +1,35 @@
+services:
+  mybb:
+    build:
+      context: .
+      args:
+        MYBB_BASE: ${MYBB_BASE:-php:8.1-apache}
+        MYBB_URL: ${MYBB_URL}
+        MYBB_VERSION: ${MYBB_VER:-unknown}
+    image: mybb:${MYBB_VER}
+    container_name: mybb
+    restart: unless-stopped
+    depends_on:
+      - mysql
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - data:/var/www/html
+    ports:
+      - "${HTTP_PORT:-80}:80"
+
+  mysql:
+    image: mysql:8.0
+    container_name: mybb-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-RootPassword123}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-mybb}
+      MYSQL_USER: ${MYSQL_USER:-mybb}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-MybbStrongPass123}
+    volumes:
+      - db:/var/lib/mysql
+
+volumes:
+  data:
+  db:
